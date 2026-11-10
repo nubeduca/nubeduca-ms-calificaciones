@@ -1,0 +1,35 @@
+org: marianosanchez
+service: nubeduca-ms-calificaciones
+
+provider:
+  name: aws
+  runtime: python3.13
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 20
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    TABLA_CALIFICACIONES: ${sls:stage}-t_calificaciones
+    VALIDAR_TOKEN: "false"
+    VALIDAR_TOKEN_FUNCION: nubeduca-ms-usuarios-${sls:stage}-validar
+    NOTA_MINIMA_APROBATORIA: "11"
+
+resources:
+  Resources:
+    TablaCalificaciones:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${sls:stage}-t_calificaciones
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenant_curso
+            AttributeType: S
+          - AttributeName: email_evaluacion
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenant_curso
+            KeyType: HASH
+          - AttributeName: email_evaluacion
+            KeyType: RANGE
