@@ -1,0 +1,4 @@
+# LF en todo el repo, también en Windows (yamllint y los scripts lo necesitan).
+* text=auto eol=lf
+*.pdf binary
+*.png binary
