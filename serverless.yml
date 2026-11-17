@@ -1,5 +1,30 @@
-org: marianosanchez
+# ms-calificaciones: libro de notas y publicación ordenada (EVA-02) y auditoría inmutable de notas (DAT-01).
+# Contrato: nubeduca-contratos/apis/ms-calificaciones.openapi.yaml · source de eventos: lms.grading
+#
+# Parámetros (serverless deploy --stage dev --param="outbox=pipe"):
+#   busName   bus de EventBridge. Si no se pasa, se lee del SSM /nubeduca/<stage>/bus-name
+#             (lms-<stage>, de infra/base); si no existe, usa 'lms'.
+#   outbox    lambda (por defecto) | pipe. Cómo viaja el outbox del Stream al bus.
+#   authMode  mock (por defecto, hasta AUTH-01) | cognito.
+#
+# Sin `org:` fija: Serverless v4 toma la org de SERVERLESS_ACCESS_KEY (o de `serverless login`),
+# así el mismo archivo se despliega en la cuenta de cualquier integrante.
 service: nubeduca-ms-calificaciones
+
+params:
+  default:
+    outbox: lambda
+    authMode: mock
+
+custom:
+  busName: ${param:busName, ssm:/nubeduca/${sls:stage}/bus-name, 'lms'}
+  relayEncendido:
+    lambda: true
+    pipe: false
+  tablaAuditoria: ${sls:stage}-t_calificaciones_auditoria
+  # DAT-01: en prod la tabla de auditoría no se puede borrar ni con `serverless remove`.
+  protegerAuditoria:
+    prod: true
 
 provider:
   name: aws
@@ -9,27 +34,287 @@ provider:
   memorySize: 256
   timeout: 20
   iam:
-    role: arn:aws:iam::${aws:accountId}:role/LabRole
+    role: arn:aws:iam::${aws:accountId}:role/LabRole   # Learner Lab no deja crear roles
+  # PLT-06: trazas de API Gateway y Lambda en X-Ray.
+  tracing:
+    apiGateway: true
+    lambda: true
   environment:
-    TABLA_CALIFICACIONES: ${sls:stage}-t_calificaciones
-    VALIDAR_TOKEN: "false"
-    VALIDAR_TOKEN_FUNCION: nubeduca-ms-usuarios-${sls:stage}-validar
-    NOTA_MINIMA_APROBATORIA: "11"
+    SERVICIO: ms-calificaciones
+    EVENT_SOURCE: lms.grading
+    TABLA: ${sls:stage}-t_calificaciones
+    TABLA_AUDITORIA: ${self:custom.tablaAuditoria}
+    EVENT_BUS: ${self:custom.busName}
+    AUTH_MODE: ${param:authMode}
+
+package:
+  patterns:
+    - '!tests/**'
+    - '!scripts/**'
+    - '!.venv/**'
+    - '!requirements-dev.txt'
+
+functions:
+  salud:
+    handler: api/salud.lambda_handler
+    events:
+      - http: { path: /health, method: get, cors: true }
+
+  # DAT-01. Con AUTH-01 listo, agrega a cada ruta:
+  #   authorizer: { type: COGNITO_USER_POOLS, arn: ${param:userPoolArn} }
+  historial:
+    handler: api/historial.lambda_handler
+    events:
+      - http: { path: '/grades/{gradeId}/history', method: get, cors: true }
+
+  # DAT-01. Registra cada grade.changed en la tabla de auditoría (solo agregar).
+  auditoria:
+    handler: consumidores/auditoria.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaAuditoria.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  # De ms-cursos: enrollment.created/dropped (quién es TEACHER o STUDENT del curso).
+  consumidor:
+    handler: consumidores/matriculas.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaEventos.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  # Outbox -> bus (solo si outbox=lambda). Lee el Stream y publica los EVENTO#.
+  relayOutbox:
+    handler: relay/stream_a_bus.lambda_handler
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt Tabla.StreamArn
+          enabled: ${self:custom.relayEncendido.${param:outbox}}
+          startingPosition: LATEST
+          batchSize: 10
+          maximumRetryAttempts: 10
+          filterPatterns:
+            - eventName: [INSERT]
+              dynamodb:
+                Keys:
+                  sk:
+                    S: [{ prefix: 'EVENTO#' }]
 
 resources:
+  Conditions:
+    UsarPipe: !Equals ['${param:outbox}', 'pipe']
+
   Resources:
-    TablaCalificaciones:
+    # Tabla principal: PK tenant_id + sk. El Stream alimenta el outbox (EVA-02 publica desde aquí).
+    Tabla:
       Type: AWS::DynamoDB::Table
       Properties:
         TableName: ${sls:stage}-t_calificaciones
         BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
-          - AttributeName: tenant_curso
-            AttributeType: S
-          - AttributeName: email_evaluacion
-            AttributeType: S
+          - { AttributeName: tenant_id, AttributeType: S }
+          - { AttributeName: sk, AttributeType: S }
         KeySchema:
-          - AttributeName: tenant_curso
-            KeyType: HASH
-          - AttributeName: email_evaluacion
-            KeyType: RANGE
+          - { AttributeName: tenant_id, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # DAT-01: auditoría de notas. Solo se agregan registros:
+    # - la política de recurso niega editar o borrar ítems a CUALQUIER principal (LabRole incluido);
+    # - el código solo hace PutItem con attribute_not_exists(sk);
+    # - sin TTL (nada expira) y con PITR para recuperar la tabla si alguien la borra.
+    TablaAuditoria:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tablaAuditoria}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: tenant_id, AttributeType: S }
+          - { AttributeName: sk, AttributeType: S }
+        KeySchema:
+          - { AttributeName: tenant_id, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        DeletionProtectionEnabled: ${self:custom.protegerAuditoria.${sls:stage}, false}
+        ResourcePolicy:
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuditoriaSoloAgregar
+                Effect: Deny
+                Principal: '*'
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PartiQLUpdate
+                  - dynamodb:PartiQLDelete
+                Resource: arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.tablaAuditoria}
+
+    # Outbox con EventBridge Pipes (outbox=pipe). Falta confirmar que el LabRole lo permita.
+    PipeOutbox:
+      Type: AWS::Pipes::Pipe
+      Condition: UsarPipe
+      Properties:
+        Name: ${self:service}-${sls:stage}-outbox
+        RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
+        Source: !GetAtt Tabla.StreamArn
+        SourceParameters:
+          DynamoDBStreamParameters:
+            StartingPosition: LATEST
+            BatchSize: 1
+            MaximumRetryAttempts: 10
+          FilterCriteria:
+            Filters:
+              - Pattern: '{"eventName":["INSERT"],"dynamodb":{"Keys":{"sk":{"S":[{"prefix":"EVENTO#"}]}}}}'
+        Target: arn:aws:events:${aws:region}:${aws:accountId}:event-bus/${self:custom.busName}
+        TargetParameters:
+          InputTemplate: '<$.dynamodb.NewImage.detail.S>'
+          EventBridgeEventBusParameters:
+            Source: '$.dynamodb.NewImage.source.S'
+            DetailType: '$.dynamodb.NewImage.detailType.S'
+
+    # --- Consumidor de ms-cursos: regla -> cola -> Lambda (DLQ tras 5 intentos) --------
+    ColaEventosDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-eventos-dlq
+        MessageRetentionPeriod: 1209600
+
+    ColaEventos:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-eventos
+        VisibilityTimeout: 120
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaEventosDLQ.Arn
+          maxReceiveCount: 5
+
+    ReglaConsumidor:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: nubeduca-${sls:stage}-calificaciones
+        EventBusName: ${self:custom.busName}
+        EventPattern:
+          source: [lms.courses]
+          detail-type: [lms.courses.enrollment.created.v1, lms.courses.enrollment.dropped.v1]
+        Targets:
+          - Id: cola-calificaciones
+            Arn: !GetAtt ColaEventos.Arn
+
+    PoliticaColaEventos:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref ColaEventos]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaEventos.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ReglaConsumidor.Arn
+
+    # --- Auditoría (DAT-01): grade.changed -> cola -> Lambda (DLQ tras 5 intentos) -------
+    ColaAuditoriaDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-auditoria-dlq
+        MessageRetentionPeriod: 1209600
+
+    ColaAuditoria:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-auditoria
+        VisibilityTimeout: 120
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaAuditoriaDLQ.Arn
+          maxReceiveCount: 5
+
+    ReglaAuditoria:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: nubeduca-${sls:stage}-calificaciones-auditoria
+        EventBusName: ${self:custom.busName}
+        EventPattern:
+          source: [lms.grading]
+          detail-type: [lms.grading.grade.changed.v1]
+        Targets:
+          - Id: cola-auditoria
+            Arn: !GetAtt ColaAuditoria.Arn
+
+    PoliticaColaAuditoria:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref ColaAuditoria]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaAuditoria.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ReglaAuditoria.Arn
+
+    # PLT-06: alarma si algún evento termina en una DLQ (falló 5 veces).
+    AlarmaDLQ:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nubeduca-${sls:stage}-calificaciones-eventos-dlq
+        AlarmDescription: Hay eventos de matrícula que ms-calificaciones no pudo procesar
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ColaEventosDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    AlarmaAuditoriaDLQ:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nubeduca-${sls:stage}-calificaciones-auditoria-dlq
+        AlarmDescription: Hay cambios de nota que la auditoría no pudo registrar
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ColaAuditoriaDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    # URL de la API para el frontend (infra/frontend de nubeduca-backend la lee de aquí).
+    ApiUrlParam:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: /nubeduca/${sls:stage}/api/calificaciones/url
+        Type: String
+        Value: !Join ['', ['https://', !Ref ApiGatewayRestApi, '.execute-api.${aws:region}.amazonaws.com/${sls:stage}']]
+
+  Outputs:
+    TablaNombre:
+      Value: !Ref Tabla
+    TablaAuditoria:
+      Value: !Ref TablaAuditoria
+    ColaAuditoriaUrl:
+      Value: !Ref ColaAuditoria
+    ApiUrl:
+      Value: !Join ['', ['https://', !Ref ApiGatewayRestApi, '.execute-api.${aws:region}.amazonaws.com/${sls:stage}']]
