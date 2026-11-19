@@ -80,6 +80,23 @@ def item_outbox(evento: dict) -> dict:
     }
 
 
+def validar(evento: dict) -> None:
+    try:
+        esquemas.validar(evento["detailType"], evento["detail"])
+    except esquemas.EventoInvalido as exc:
+        logs.error(mensaje="Evento no cumple su contrato", detailType=exc.detail_type, errores=exc.errores)
+        raise
+
+
+def escritura(evento: dict) -> dict:
+    """
+    El evento como escritura de TransactWriteItems (sin TableName), ya validado. Sirve para que
+    un consumidor publique dentro de la misma transacción del inbox (lib/inbox.py).
+    """
+    validar(evento)
+    return {"Put": {"Item": item_outbox(evento), "ConditionExpression": "attribute_not_exists(sk)"}}
+
+
 def guardar(cambios: list[dict], eventos: list[dict]) -> None:
     """
     Guarda los cambios de estado y sus eventos en una sola transacción.
@@ -89,27 +106,12 @@ def guardar(cambios: list[dict], eventos: list[dict]) -> None:
         {"Update": {"Key": {...}, "UpdateExpression": "...", ...}}
     Máximo 100 operaciones por transacción (límite de DynamoDB).
     """
-    for evento in eventos:  # contrato primero: si un evento no cumple, no se escribe nada
-        try:
-            esquemas.validar(evento["detailType"], evento["detail"])
-        except esquemas.EventoInvalido as exc:
-            logs.error(mensaje="Evento no cumple su contrato", detailType=exc.detail_type, errores=exc.errores)
-            raise
+    escrituras = [escritura(e) for e in eventos]  # contrato primero: si un evento no cumple, no se escribe nada
     nombre = t.tabla().name
     operaciones = []
-    for cambio in cambios:
+    for cambio in cambios + escrituras:
         (accion, cuerpo), = cambio.items()
         operaciones.append({accion: {"TableName": nombre, **cuerpo}})
-    for evento in eventos:
-        operaciones.append(
-            {
-                "Put": {
-                    "TableName": nombre,
-                    "Item": item_outbox(evento),
-                    "ConditionExpression": "attribute_not_exists(sk)",
-                }
-            }
-        )
     try:
         t.cliente().transact_write_items(TransactItems=operaciones)
     except ClientError as exc:
