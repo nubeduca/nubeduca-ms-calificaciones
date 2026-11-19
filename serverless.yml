@@ -6,6 +6,8 @@
 #             (lms-<stage>, de infra/base); si no existe, usa 'lms'.
 #   outbox    lambda (por defecto) | pipe. Cómo viaja el outbox del Stream al bus.
 #   authMode  mock (por defecto, hasta AUTH-01) | cognito.
+#   notasTopic  tópico SNS FIFO de notas publicadas (por defecto nubeduca-<stage>-notas.fifo, de
+#             infra/bus en nubeduca-backend). Con el nombre viejo: --param="notasTopic=dev-notas.fifo"
 #
 # Sin `org:` fija: Serverless v4 toma la org de SERVERLESS_ACCESS_KEY (o de `serverless login`),
 # así el mismo archivo se despliega en la cuenta de cualquier integrante.
@@ -22,6 +24,7 @@ custom:
     lambda: true
     pipe: false
   tablaAuditoria: ${sls:stage}-t_calificaciones_auditoria
+  notasTopic: ${param:notasTopic, 'nubeduca-${sls:stage}-notas.fifo'}
   # DAT-01: en prod la tabla de auditoría no se puede borrar ni con `serverless remove`.
   protegerAuditoria:
     prod: true
@@ -67,6 +70,37 @@ functions:
     events:
       - http: { path: '/grades/{gradeId}/history', method: get, cors: true }
 
+  # EVA-02. Con AUTH-01 listo, agrega el mismo authorizer que en historial.
+  libro:
+    handler: api/libro.lambda_handler
+    events:
+      - http: { path: '/courses/{courseId}/gradebook', method: get, cors: true }
+      - http: { path: '/courses/{courseId}/grades/me', method: get, cors: true }
+
+  notas:
+    handler: api/notas.lambda_handler
+    events:
+      - http: { path: '/grade-items/{gradeItemId}/post', method: post, cors: true }
+      - http: { path: '/grades/{gradeId}', method: patch, cors: true }
+
+  # EVA-02. assignment.published -> columna del libro de notas.
+  consumidorColumnas:
+    handler: consumidores/columnas.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaColumnas.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  # EVA-02. submission.graded -> nota en DRAFT + grade.changed por el outbox.
+  consumidorNotas:
+    handler: consumidores/notas.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaNotas.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
   # DAT-01. Registra cada grade.changed en la tabla de auditoría (solo agregar).
   auditoria:
     handler: consumidores/auditoria.lambda_handler
@@ -103,12 +137,38 @@ functions:
                   sk:
                     S: [{ prefix: 'EVENTO#' }]
 
+  # EVA-02. grade.posted del outbox -> SNS FIFO, en orden (MessageGroupId = <tenantId>:<courseId>).
+  # Siempre encendido (el Pipe solo llega al bus). Sin bisect ni paralelismo: reintenta en orden.
+  relayNotas:
+    handler: relay/stream_a_sns.lambda_handler
+    environment:
+      TOPIC_NOTAS: arn:aws:sns:${aws:region}:${aws:accountId}:${self:custom.notasTopic}
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt Tabla.StreamArn
+          startingPosition: LATEST
+          batchSize: 10
+          parallelizationFactor: 1
+          bisectBatchOnFunctionError: false
+          maximumRetryAttempts: 10
+          filterPatterns:
+            - eventName: [INSERT]
+              dynamodb:
+                Keys:
+                  sk:
+                    S: [{ prefix: 'EVENTO#' }]
+                NewImage:
+                  detailType:
+                    S: [lms.grading.grade.posted.v1]
+
 resources:
   Conditions:
     UsarPipe: !Equals ['${param:outbox}', 'pipe']
 
   Resources:
-    # Tabla principal: PK tenant_id + sk. El Stream alimenta el outbox (EVA-02 publica desde aquí).
+    # Tabla principal: PK tenant_id + sk. Libro de notas (EVA-02). El Stream alimenta el outbox
+    # (relayOutbox o el Pipe -> bus) y relayNotas (grade.posted -> SNS FIFO).
     Tabla:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -224,6 +284,90 @@ resources:
                 ArnEquals:
                   aws:SourceArn: !GetAtt ReglaConsumidor.Arn
 
+    # --- Columnas (EVA-02): assignment.published -> cola -> Lambda (DLQ tras 5 intentos) ---
+    ColaColumnasDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-columnas-dlq
+        MessageRetentionPeriod: 1209600
+
+    ColaColumnas:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-columnas
+        VisibilityTimeout: 120
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaColumnasDLQ.Arn
+          maxReceiveCount: 5
+
+    ReglaColumnas:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: nubeduca-${sls:stage}-calificaciones-columnas
+        EventBusName: ${self:custom.busName}
+        EventPattern:
+          source: [lms.assessment]
+          detail-type: [lms.assessment.assignment.published.v1]
+        Targets:
+          - Id: cola-columnas
+            Arn: !GetAtt ColaColumnas.Arn
+
+    PoliticaColaColumnas:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref ColaColumnas]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaColumnas.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ReglaColumnas.Arn
+
+    # --- Notas (EVA-02): submission.graded -> cola -> Lambda (DLQ tras 5 intentos) ---------
+    ColaNotasDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-notas-dlq
+        MessageRetentionPeriod: 1209600
+
+    ColaNotas:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-calificaciones-notas
+        VisibilityTimeout: 120
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaNotasDLQ.Arn
+          maxReceiveCount: 5
+
+    ReglaNotas:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: nubeduca-${sls:stage}-calificaciones-notas
+        EventBusName: ${self:custom.busName}
+        EventPattern:
+          source: [lms.assessment]
+          detail-type: [lms.assessment.submission.graded.v1]
+        Targets:
+          - Id: cola-notas
+            Arn: !GetAtt ColaNotas.Arn
+
+    PoliticaColaNotas:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref ColaNotas]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaNotas.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ReglaNotas.Arn
+
     # --- Auditoría (DAT-01): grade.changed -> cola -> Lambda (DLQ tras 5 intentos) -------
     ColaAuditoriaDLQ:
       Type: AWS::SQS::Queue
@@ -301,6 +445,40 @@ resources:
         ComparisonOperator: GreaterThanOrEqualToThreshold
         TreatMissingData: notBreaching
 
+    AlarmaColumnasDLQ:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nubeduca-${sls:stage}-calificaciones-columnas-dlq
+        AlarmDescription: Hay tareas publicadas que no se pudieron agregar al libro de notas
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ColaColumnasDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    AlarmaNotasDLQ:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nubeduca-${sls:stage}-calificaciones-notas-dlq
+        AlarmDescription: Hay calificaciones de entregas que no se pudieron guardar en el libro de notas
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ColaNotasDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
     # URL de la API para el frontend (infra/frontend de nubeduca-backend la lee de aquí).
     ApiUrlParam:
       Type: AWS::SSM::Parameter
@@ -316,5 +494,9 @@ resources:
       Value: !Ref TablaAuditoria
     ColaAuditoriaUrl:
       Value: !Ref ColaAuditoria
+    ColaColumnasUrl:
+      Value: !Ref ColaColumnas
+    ColaNotasUrl:
+      Value: !Ref ColaNotas
     ApiUrl:
       Value: !Join ['', ['https://', !Ref ApiGatewayRestApi, '.execute-api.${aws:region}.amazonaws.com/${sls:stage}']]

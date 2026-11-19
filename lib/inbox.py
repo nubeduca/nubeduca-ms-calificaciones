@@ -88,8 +88,16 @@ def _motivo_descarte(evento: Evento) -> str | None:
     return None
 
 
+class Conflicto(RuntimeError):
+    """Falló la condición de una escritura de la reacción (no la del inbox): el evento se reintenta."""
+
+
 def _confirmar(evento: Evento, escrituras: list) -> bool:
-    """TransactWriteItems: inbox + versión + cambios. False si otro proceso ganó la carrera."""
+    """
+    TransactWriteItems: inbox + versión + cambios. False si otro proceso ganó la carrera (el
+    inbox o la versión ya estaban escritos). Si lo que falló es la condición de una escritura de
+    la reacción, lanza Conflicto: el evento no es un duplicado y debe reintentarse.
+    """
     nombre = t.tabla().name
     operaciones = [
         {
@@ -127,9 +135,12 @@ def _confirmar(evento: Evento, escrituras: list) -> bool:
         t.cliente().transact_write_items(TransactItems=operaciones)
         return True
     except ClientError as exc:
-        if exc.response["Error"]["Code"] == "TransactionCanceledException":
+        if exc.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        motivos = [m.get("Code") for m in exc.response.get("CancellationReasons") or []]
+        if not motivos or "ConditionalCheckFailed" in motivos[:2]:
             return False
-        raise
+        raise Conflicto(f"La transacción del evento {evento.event_id} se canceló: {motivos}") from exc
 
 
 def procesar(evento: Evento, reacciones: dict) -> str:

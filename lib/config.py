@@ -23,6 +23,11 @@ def auth_mode() -> str:
     return os.environ.get("AUTH_MODE", "cognito").lower()
 
 
+def topic_notas() -> str:
+    """ARN del tópico SNS FIFO nubeduca-<stage>-notas.fifo (lo crea infra/bus de nubeduca-backend)."""
+    return os.environ.get("TOPIC_NOTAS", "")
+
+
 def tabla_auditoria() -> str:
     """Tabla de la auditoría de notas (DAT-01): solo se agregan registros, nunca se editan."""
     return os.environ.get("TABLA_AUDITORIA", "dev-t_calificaciones_auditoria")
