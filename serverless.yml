@@ -4,7 +4,7 @@
 # Parámetros (serverless deploy --stage dev --param="outbox=pipe"):
 #   busName   bus de EventBridge. Si no se pasa, se lee del SSM /nubeduca/<stage>/bus-name
 #             (lms-<stage>, de infra/base); si no existe, usa 'lms'.
-#   outbox    lambda (por defecto) | pipe. Cómo viaja el outbox del Stream al bus.
+#   outbox    pipe (por defecto, ADR-008) | lambda (relay, vuelta atrás). Cómo viaja el outbox del Stream al bus.
 #   authMode  mock (por defecto, hasta AUTH-01) | cognito.
 #   notasTopic  tópico SNS FIFO de notas publicadas (por defecto nubeduca-<stage>-notas.fifo, de
 #             infra/bus en nubeduca-backend). Con el nombre viejo: --param="notasTopic=dev-notas.fifo"
@@ -15,7 +15,7 @@ service: nubeduca-ms-calificaciones
 
 params:
   default:
-    outbox: lambda
+    outbox: pipe
     authMode: mock
 
 custom:
@@ -119,7 +119,7 @@ functions:
           batchSize: 10
           functionResponseType: ReportBatchItemFailures
 
-  # Outbox -> bus (solo si outbox=lambda). Lee el Stream y publica los EVENTO#.
+  # Relay outbox -> bus, solo con outbox=lambda (vuelta atrás de ADR-008). Lee el Stream y publica los EVENTO#.
   relayOutbox:
     handler: relay/stream_a_bus.lambda_handler
     events:
@@ -219,7 +219,7 @@ resources:
                   - dynamodb:PartiQLDelete
                 Resource: arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.tablaAuditoria}
 
-    # Outbox con EventBridge Pipes (outbox=pipe). Falta confirmar que el LabRole lo permita.
+    # Outbox con EventBridge Pipes (outbox=pipe, por defecto desde ADR-008). El LabRole lo permite (GATE-0).
     PipeOutbox:
       Type: AWS::Pipes::Pipe
       Condition: UsarPipe
