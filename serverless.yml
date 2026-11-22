@@ -19,6 +19,14 @@ params:
     authMode: mock
 
 custom:
+  # REL-02: authorizer de Cognito en las rutas, solo con authMode=cognito. Con mock no hay authorizer
+  # (API Gateway rechazaría los tokens mock) y lib/auth.py lee el token del header.
+  # El User Pool sale de infra/auth (stack nubeduca-infra-auth-<stage>) o de --param="userPoolArn=...".
+  userPoolArn: ${param:userPoolArn, cf:nubeduca-infra-auth-${sls:stage}.UserPoolArn, ''}
+  autorizador:
+    cognito:
+      type: COGNITO_USER_POOLS
+      arn: ${self:custom.userPoolArn}
   busName: ${param:busName, ssm:/nubeduca/${sls:stage}/bus-name, 'lms'}
   relayEncendido:
     lambda: true
@@ -63,25 +71,24 @@ functions:
     events:
       - http: { path: /health, method: get, cors: true }
 
-  # DAT-01. Con AUTH-01 listo, agrega a cada ruta:
-  #   authorizer: { type: COGNITO_USER_POOLS, arn: ${param:userPoolArn} }
+  # DAT-01. Authorizer de Cognito con authMode=cognito (custom.autorizador).
   historial:
     handler: api/historial.lambda_handler
     events:
-      - http: { path: '/grades/{gradeId}/history', method: get, cors: true }
+      - http: { path: '/grades/{gradeId}/history', method: get, cors: true, authorizer: '${self:custom.autorizador.${param:authMode}, null}' }
 
-  # EVA-02. Con AUTH-01 listo, agrega el mismo authorizer que en historial.
+  # EVA-02. Mismo authorizer de Cognito (custom.autorizador).
   libro:
     handler: api/libro.lambda_handler
     events:
-      - http: { path: '/courses/{courseId}/gradebook', method: get, cors: true }
-      - http: { path: '/courses/{courseId}/grades/me', method: get, cors: true }
+      - http: { path: '/courses/{courseId}/gradebook', method: get, cors: true, authorizer: '${self:custom.autorizador.${param:authMode}, null}' }
+      - http: { path: '/courses/{courseId}/grades/me', method: get, cors: true, authorizer: '${self:custom.autorizador.${param:authMode}, null}' }
 
   notas:
     handler: api/notas.lambda_handler
     events:
-      - http: { path: '/grade-items/{gradeItemId}/post', method: post, cors: true }
-      - http: { path: '/grades/{gradeId}', method: patch, cors: true }
+      - http: { path: '/grade-items/{gradeItemId}/post', method: post, cors: true, authorizer: '${self:custom.autorizador.${param:authMode}, null}' }
+      - http: { path: '/grades/{gradeId}', method: patch, cors: true, authorizer: '${self:custom.autorizador.${param:authMode}, null}' }
 
   # EVA-02. assignment.published -> columna del libro de notas.
   consumidorColumnas:
@@ -167,6 +174,27 @@ resources:
     UsarPipe: !Equals ['${param:outbox}', 'pipe']
 
   Resources:
+    # REL-02: los errores que responde API Gateway sin llegar a la Lambda (por ejemplo, el 401 del
+    # authorizer de Cognito cuando el token venció) también llevan CORS; si no, el navegador los
+    # muestra como "error de CORS" y el frontend no sabe que tiene que volver a iniciar sesión.
+    RespuestaGateway4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        ResponseType: DEFAULT_4XX
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+
+    RespuestaGateway5XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        ResponseType: DEFAULT_5XX
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+
     # Tabla principal: PK tenant_id + sk. Libro de notas (EVA-02). El Stream alimenta el outbox
     # (relayOutbox o el Pipe -> bus) y relayNotas (grade.posted -> SNS FIFO).
     Tabla:
